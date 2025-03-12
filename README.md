@@ -1,4 +1,5 @@
 navigate to where you would like to use the tool from and git clone this repo. 
+``` #!/bin/bash
 cd auto-spray
 chmod +x setup.sh
 ./setup.sh
